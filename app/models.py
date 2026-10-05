@@ -182,6 +182,18 @@ class InventoryPlanIn(BaseModel):
         return v
 
 
+class RecallIn(BaseModel):
+    """Irrevocable contamination recall of a stock batch."""
+    reason: str = Field(min_length=1, max_length=1000)
+
+    @field_validator("reason")
+    @classmethod
+    def _reason(cls, v):
+        if not v.strip():
+            raise ValueError("reason must not be blank")
+        return v
+
+
 # --------------------------------------------------------------------------- #
 # Response pieces
 # --------------------------------------------------------------------------- #

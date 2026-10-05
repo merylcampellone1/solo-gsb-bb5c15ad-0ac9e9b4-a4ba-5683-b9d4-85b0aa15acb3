@@ -16,12 +16,14 @@ from .db import (
     get_batch,
     get_batches,
     get_frozen,
+    get_recall,
     get_reservation,
     list_batches,
+    recall_batch,
     reserve_and_freeze,
     transition_reservation,
 )
-from .models import BatchRegisterIn, InventoryPlanIn, PlanRequest
+from .models import BatchRegisterIn, InventoryPlanIn, PlanRequest, RecallIn
 from .planning import (
     build_inventory_problem,
     build_problem,
@@ -31,6 +33,7 @@ from .planning import (
     relabel_plan,
     request_hash,
     stock_usage_from_plan,
+    traced_wells_for_batch,
 )
 from .solver import solve
 
@@ -44,12 +47,15 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Microplate Dilution Planner",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "Computes an exact, executable pipetting plan for microplate wells. "
         "Volumes are integer nanoliters; concentrations are rationals. "
         "Inventory mode plans against registered stock batches with atomic, "
-        "oversell-proof reservations and a confirm/cancel lifecycle."
+        "oversell-proof reservations and a confirm/cancel lifecycle. "
+        "Contaminated batches can be irrevocably recalled: new reservations "
+        "and pending confirms are rejected, and the frozen recall report "
+        "traces affected plans and target wells through intermediate liquids."
     ),
     lifespan=lifespan,
 )
@@ -217,6 +223,82 @@ async def batch_detail(batch_id: str):
 
 
 # --------------------------------------------------------------------------- #
+# Batch recall (irrevocable)
+# --------------------------------------------------------------------------- #
+
+
+def _build_recall_report(batch_id: str, candidates: list) -> dict:
+    """Affected plans/wells for a batch, from live reservations + frozen plans.
+
+    Only reservations in ``reserved`` / ``confirmed`` state that actually drew
+    from the batch are present (a ``reservation_items`` row exists iff the
+    plan drew volume). Each target well reached from the batch through the
+    transfer chain (possibly via intermediate liquids) is listed once per
+    plan, annotated with that reservation's status.
+    """
+    plans_out = []
+    for c in candidates:
+        payload = c["payload"]
+        plan = payload.get("plan", {})
+        wells = traced_wells_for_batch(plan, batch_id)
+        plans_out.append({
+            "request_id": c["request_id"],
+            "reservation_status": c["status"],
+            "drawn_nl": c["amount_nl"],
+            "wells": wells,
+        })
+    return {
+        "batch_id": batch_id,
+        "affected_plan_count": len(plans_out),
+        "plans": plans_out,
+    }
+
+
+@app.post("/batches/{batch_id}/recall")
+async def recall_batch_route(batch_id: str, req: RecallIn):
+    outcome, data = await recall_batch(
+        app.state.db, batch_id, req.reason,
+        lambda candidates: _build_recall_report(batch_id, candidates),
+    )
+    if outcome == "unknown":
+        return JSONResponse(
+            status_code=404,
+            content={"error": "unknown_batch",
+                     "detail": f"no batch registered with id {batch_id!r}"},
+        )
+    if outcome == "replay":
+        return JSONResponse(status_code=200, content=data)
+    if outcome == "conflict":
+        return JSONResponse(
+            status_code=409,
+            content={"error": "recall_reason_conflict",
+                     "detail": f"batch {batch_id!r} is already recalled with "
+                               "a different reason; recalls are irrevocable",
+                     "existing_reason": data["reason"],
+                     "recalled_at": data["recalled_at"]},
+        )
+    return JSONResponse(status_code=201, content=data)
+
+
+@app.get("/batches/{batch_id}/recall")
+async def get_recall_route(batch_id: str):
+    result = await get_recall(app.state.db, batch_id)
+    if result == "missing":
+        return JSONResponse(
+            status_code=404,
+            content={"error": "unknown_batch",
+                     "detail": f"no batch registered with id {batch_id!r}"},
+        )
+    if result is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "not_found",
+                     "detail": f"batch {batch_id!r} has not been recalled"},
+        )
+    return result
+
+
+# --------------------------------------------------------------------------- #
 # Inventory-mode planning with atomic reservations
 # --------------------------------------------------------------------------- #
 
@@ -275,6 +357,20 @@ async def create_inventory_plan(
                                + ", ".join(missing)},
         )
 
+    recalled = [b for b in req.batch_ids if batches[b]["recalled"]]
+    if recalled:
+        # Explicit rejection, without freezing the request id: the same
+        # X-Request-ID stays reusable later. The authoritative re-check
+        # inside reserve_and_freeze() settles the race with a concurrent
+        # first-time recall.
+        return JSONResponse(
+            status_code=409,
+            content={"error": "batch_recalled",
+                     "detail": "referenced batch(es) have been recalled: "
+                               + ", ".join(sorted(recalled)),
+                     "recalled_batches": sorted(recalled)},
+        )
+
     prob = build_inventory_problem(req, batches)
     result = solve(prob)
 
@@ -328,6 +424,17 @@ async def create_inventory_plan(
                      "detail": "batch disappeared while planning: "
                                + ", ".join(detail)},
         )
+    if outcome == "recalled":
+        # A concurrent recall committed while this request was planning; the
+        # authoritative batch state wins. Nothing was frozen or reserved, so
+        # the request id is not consumed.
+        return JSONResponse(
+            status_code=409,
+            content={"error": "batch_recalled",
+                     "detail": "referenced batch(es) were recalled "
+                               "concurrently: " + ", ".join(detail),
+                     "recalled_batches": detail},
+        )
     # insufficient inventory: explain, freeze the negative result, and
     # reserve nothing.
     payload = {
@@ -376,6 +483,22 @@ async def _transition(request_id: str, action: str) -> JSONResponse:
                      "detail": f"no reservation for request {request_id}"},
         )
     target = "confirmed" if action == "confirm" else "cancelled"
+    if action == "confirm" and result.get("recalled"):
+        # A pending reservation that consumes a recalled batch may not be
+        # confirmed; it can still be cancelled.
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "batch_recalled",
+                "detail": "cannot confirm a pending reservation that draws "
+                          "from recalled batch(es): "
+                          + ", ".join(result["recalled"])
+                          + "; the reservation can still be cancelled",
+                "request_id": request_id,
+                "status": result["status"],
+                "recalled_batches": result["recalled"],
+            },
+        )
     if not result["changed"] and result["status"] != target:
         return JSONResponse(
             status_code=409,

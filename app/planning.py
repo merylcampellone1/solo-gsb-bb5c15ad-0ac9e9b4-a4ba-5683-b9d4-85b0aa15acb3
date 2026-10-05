@@ -72,6 +72,48 @@ def stock_usage_from_plan(plan: dict) -> dict:
     return usage
 
 
+def _node_key(node: dict) -> tuple:
+    """Identity key for a transfer endpoint.
+
+    Intermediates are identified by their container (the physical vessel the
+    intermediate liquid resides in); stocks and wells by their id.
+    """
+    kind = node.get("kind")
+    if kind == "intermediate":
+        return ("intermediate", node.get("container"))
+    if kind == "stock":
+        return ("stock", node.get("id"))
+    if kind == "well":
+        return ("well", node.get("id"))
+    return (kind, node.get("id"))
+
+
+def traced_wells_for_batch(plan: dict, batch_id: str) -> list[str]:
+    """Wells that receive liquid originating from ``batch_id``.
+
+    The trace follows transfer steps forward from the batch stock through any
+    intermediate vessels to the target wells, so wells reached only through a
+    serial-dilution chain are included. Each well is reported at most once,
+    in first-reach (transfer-step) order.
+    """
+    reached = {("stock", batch_id)}
+    wells: list[str] = []
+    seen = set()
+    for t in plan["transfers"]:
+        src = _node_key(t["source"])
+        dst = t["destination"]
+        if src not in reached:
+            continue
+        dkey = _node_key(dst)
+        if dkey in reached:
+            continue
+        reached.add(dkey)
+        if dst.get("kind") == "well" and dst.get("id") not in seen:
+            seen.add(dst["id"])
+            wells.append(dst["id"])
+    return wells
+
+
 def container_ids(req) -> list[str]:
     ids = []
     for i, c in enumerate(req.containers):

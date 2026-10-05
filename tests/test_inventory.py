@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 
 import app.db as db
 import app.main as main
+from app.planning import traced_wells_for_batch
 
 
 # --------------------------------------------------------------------------- #
@@ -33,6 +34,7 @@ class FakeStore:
         self.plans = {}         # request_id -> (hash, status, payload)
         self.batches = {}       # batch_id -> mutable row dict
         self.reservations = {}  # request_id -> {"status", "items"}
+        self.recalls = {}       # batch_id -> {"reason", "report", ...}
 
     # -- batches ----------------------------------------------------------- #
 
@@ -46,6 +48,9 @@ class FakeStore:
             "used_nl": b["used_nl"],
             "available_nl": (b["initial_volume_nl"]
                              - b["reserved_nl"] - b["used_nl"]),
+            "recalled": b.get("recalled", False),
+            "recalled_reason": b.get("recalled_reason"),
+            "recalled_at": b.get("recalled_at"),
         }
 
     async def create_batch(self, conn, batch_id, concentration, initial_nl):
@@ -54,7 +59,8 @@ class FakeStore:
             return False, self._pub(existing)
         row = {"id": batch_id, "concentration": concentration,
                "initial_volume_nl": initial_nl, "reserved_nl": 0,
-               "used_nl": 0}
+               "used_nl": 0, "recalled": False, "recalled_reason": None,
+               "recalled_at": None}
         self.batches[batch_id] = row
         return True, self._pub(row)
 
@@ -86,11 +92,17 @@ class FakeStore:
         # atomic: no awaits between the checks and the updates
         if request_id in self.plans:
             return "exists", None
-        shortages = []
         for bid in sorted(usage):
             b = self.batches.get(bid)
             if b is None:
                 return "unknown", [bid]
+        recalled = [bid for bid in sorted(usage)
+                    if self.batches[bid].get("recalled")]
+        if recalled:
+            return "recalled", recalled
+        shortages = []
+        for bid in sorted(usage):
+            b = self.batches[bid]
             available = (b["initial_volume_nl"] - b["reserved_nl"]
                          - b["used_nl"])
             if available < usage[bid]:
@@ -125,6 +137,12 @@ class FakeStore:
                   "items": [dict(i) for i in r["items"]]}
         if r["status"] != "reserved":
             return result
+        if action == "confirm":
+            recalled = [i["batch_id"] for i in r["items"]
+                        if self.batches[i["batch_id"]].get("recalled")]
+            if recalled:
+                result["recalled"] = sorted(recalled)
+                return result
         for item in r["items"]:
             b = self.batches[item["batch_id"]]
             b["reserved_nl"] -= item["amount_nl"]
@@ -134,6 +152,46 @@ class FakeStore:
         result["status"] = r["status"]
         result["changed"] = True
         return result
+
+    # -- recalls ------------------------------------------------------------ #
+
+    async def recall_batch(self, conn, batch_id, reason, make_report):
+        b = self.batches.get(batch_id)
+        if b is None:
+            return "unknown", None
+        if b.get("recalled"):
+            existing = self.recalls[batch_id]
+            outcome = ("replay" if existing["reason"] == reason
+                       else "conflict")
+            return outcome, dict(existing)
+        candidates = []
+        for rid in sorted(self.reservations):
+            r = self.reservations[rid]
+            if r["status"] not in ("reserved", "confirmed"):
+                continue
+            for item in r["items"]:
+                if item["batch_id"] == batch_id:
+                    candidates.append({
+                        "request_id": rid,
+                        "status": r["status"],
+                        "amount_nl": item["amount_nl"],
+                        "payload": self.plans[rid][2],
+                    })
+        report = make_report(candidates)
+        data = {"batch_id": batch_id, "reason": reason,
+                "recalled_at": "2026-01-01T00:00:00+00:00",
+                "report": report}
+        b["recalled"] = True
+        b["recalled_reason"] = reason
+        b["recalled_at"] = data["recalled_at"]
+        self.recalls[batch_id] = data
+        return "ok", data
+
+    async def get_recall(self, conn, batch_id):
+        if batch_id not in self.batches:
+            return "missing"
+        rec = self.recalls.get(batch_id)
+        return dict(rec) if rec is not None else None
 
 
 @pytest.fixture
@@ -154,6 +212,8 @@ def store(monkeypatch):
         ("get_reservation", st.get_reservation),
         ("reserve_and_freeze", st.reserve_and_freeze),
         ("transition_reservation", st.transition_reservation),
+        ("recall_batch", st.recall_batch),
+        ("get_recall", st.get_recall),
     ]
     for name, fn in pairs:
         monkeypatch.setattr(db, name, fn)
