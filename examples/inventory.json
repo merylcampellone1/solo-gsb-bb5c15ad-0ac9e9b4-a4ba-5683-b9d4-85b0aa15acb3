@@ -1,0 +1,14 @@
+{
+  "batch_ids": ["S1"],
+  "diluent": {"available_nl": 10000000},
+  "wells": [
+    {"id": "A1", "final_volume_nl": 1000, "final_concentration": "400"},
+    {"id": "A2", "final_volume_nl": 1000, "final_concentration": "100"}
+  ],
+  "containers": [
+    {"id": "tube-1", "capacity_nl": 10000},
+    {"id": "tube-2", "capacity_nl": 20000}
+  ],
+  "pipette": {"min_nl": 500, "max_nl": 1000, "step_nl": 100},
+  "default_well_capacity_nl": 2000
+}
