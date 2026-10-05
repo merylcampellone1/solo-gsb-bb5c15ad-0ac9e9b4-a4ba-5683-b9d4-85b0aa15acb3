@@ -9,6 +9,9 @@
 - **库存模式**（`POST /inventory/plans`）：母液以**批次**预先登记（唯一 ID、浓度、初始体积），
   多份计划共享同一批母液；计划可行时按实际转出体积**原子预留**库存，
   预留可**确认执行**（计入已用量）或**取消**（归还库存）。
+- **批次召回**（`POST /batches/{id}/recall`）：发现某批母液污染时凭**批次号 + 原因**发起
+  **不可撤销召回**；召回立即拒绝一切新引用、阻止待处理预留确认，并返回受影响的
+  库存计划与沿转移步骤（穿过中间液）追踪到的目标孔清单。
 
 - 体积一律使用**整数纳升（nL）**；
 - 浓度一律使用**有理数**（`fractions.Fraction`，输入如 `"2/3"`、`"0.25"`、`"40"`）；
@@ -36,7 +39,7 @@ docker compose up --build
 1. 拉取 `postgres:16-alpine` 并健康检查通过；
 2. 在应用镜像内 `pip install -r requirements.txt`；
 3. 应用启动时自动连接数据库并执行 `CREATE TABLE IF NOT EXISTS ...` 建表
-   （`plans`、`batches`、`reservations`、`reservation_items`）。
+   （`plans`、`batches`、`reservations`、`reservation_items`、`recalls`）。
 
 服务地址与端口：
 
@@ -117,7 +120,7 @@ docker compose up --build
 
 **响应：**
 
-- `201 Created`：新批次，体含 `id`、`concentration`、`initial_volume_nl`、`reserved_nl`、`used_nl`、`available_nl`；
+- `201 Created`：新批次，体含 `id`、`concentration`、`initial_volume_nl`、`reserved_nl`、`used_nl`、`available_nl`、`recalled`（召回后另附 `recall_reason`）；
 - `200 OK`：同 ID 且内容完全相同的重复登记（幂等），返回已存在批次；
 - `409 Conflict`：同 ID 但浓度或初始体积不同（`error: "batch_conflict"`）；
 - `400 Bad Request`：非法数值/类型。
@@ -150,6 +153,8 @@ docker compose up --build
   **失败结果同样被冻结，且不占用任何库存**。
 - `400 Bad Request`：非法数值/引用；引用未登记批次时 `error` 为 `unknown_batch`
   （不冻结、不占库存，登记后可复用同一请求号重试）。
+- `409 Conflict`：引用的批次中存在**已召回**批次时 `error` 为 `batch_recalled`
+  （附 `recalled[]`；不冻结请求号、不占库存）。
 
 ### `POST /inventory/plans/{request_id}/confirm`
 
@@ -157,6 +162,7 @@ docker compose up --build
 
 - `200 OK`：`status:"confirmed"`；重复确认幂等（`changed:false`，余额不再变动）；
 - `409 Conflict`：该预留已取消（`error: "reservation_state_conflict"`）；
+  **或其引用的任一批次已被召回**（体附 `recalled_batches`；此时仍可取消）；
 - `404 Not Found`：该请求号没有预留记录。
 
 确认后的预留**不可取消**。
@@ -177,6 +183,55 @@ docker compose up --build
 取回冻结的库存计划（可行 `200`，无解 `422`，不存在 `404`），并叠加**实时**预留状态
 （`reservation_status` 与 `reservation_items`）；`GET /plans/{request_id}` 返回的则是
 创建时刻冻结的原始结果，两者互补。
+
+### `POST /batches/{batch_id}/recall` —— 不可撤销召回
+
+某批母液被发现污染时，实验员凭**批次号**（路径）与**原因**（请求体 `{"reason": "..."}`，
+非空、≤512 字符）发起召回。召回一经生效**不可撤销、不可改因**，并以批次行的权威状态
+（与预留、确认共用同一把 `SELECT ... FOR UPDATE` 行锁）对并发操作裁决：
+召回生效后不可能再产生新预留，也不可能再确认待处理预留。
+
+**受影响清单（`affected_plans[]`）** 在召回事务内对当时的权威状态**快照冻结**，
+只包含**实际取用该批次**（计划转移中真实转出过该批母液）且预留仍处于
+`reserved` 或 `confirmed` 状态的计划；已取消的计划不列入。每条形如：
+
+| 字段 | 说明 |
+| --- | --- |
+| `request_id` | 受影响的库存计划请求号 |
+| `reservation_status` | 召回生效时该预留的状态：`reserved` / `confirmed` |
+| `drawn_nl` | 该计划从本批次实际转出的总体积（nL） |
+| `wells[]` | 沿计划的转移步骤、穿过中间液容器追踪到的目标孔；同计划同孔只列一次 |
+
+**响应：**
+
+- `201 Created`：首次召回生效；体含 `status:"recalled"`、`batch_id`、`reason`、
+  `recalled_at`、`replayed:false`、`affected_plans[]`；
+- `200 OK`：以**完全相同的原因**重复召回 —— 返回原结果（含召回当时冻结的受影响清单，
+  即使之后预留被取消/确认也不再变化），`replayed:true`；
+- `409 Conflict`：该批次已召回但原因不同（`error:"recall_conflict"`，体附原召回记录）；
+- `404 Not Found`：批次未登记（`error:"unknown_batch"`）；
+- `400 Bad Request`：原因为空等非法请求。
+
+**召回生效后的语义：**
+
+- **新请求引用该批次**：`POST /inventory/plans` 一律明确拒绝（`409 Conflict`，
+  `error:"batch_recalled"`，体附 `recalled:[{batch_id, reason}]`）；
+  **不冻结请求号、不占库存**，换用干净批次后同一 `X-Request-ID` 可直接使用。
+  与召回并发提交的计划若抢到批次行锁先完成预留，则该预留会出现在本次召回的
+  受影响清单中；抢不到锁的则被拒绝 —— 二者由权威批次状态裁决，绝不出现
+  “召回后仍有未列入清单的新预留”。
+- **待处理预留（`reserved`）**：**不可确认**（`409 reservation_state_conflict`，
+  体附 `recalled_batches`），但**仍可取消**（语义与余额不变，只归还一次）。
+- **已确认结果（`confirmed`）**：召回不改变其读取语义（`GET /plans/{id}`、
+  `GET /inventory/plans/{id}` 照常）、重试语义（同号同体重放原结果 `200`）
+  与重复确认幂等；已用量不动。召回前已冻结的请求（含原冻结结果）同样按原语义读取/重试。
+- **批次查询**：`GET /batches` 与 `GET /batches/{id}` 的批次对象新增
+  `recalled`（布尔），召回后另附 `recall_reason`。
+
+### `GET /batches/{batch_id}/recall`
+
+随时取回召回记录（含冻结的 `affected_plans[]`）：批次未召回 `404`（`error:"not_found"`），
+批次本身不存在 `404`（`error:"unknown_batch"`）。
 
 ---
 
@@ -209,6 +264,31 @@ bash examples/inventory.sh
 python3 examples/inventory_demo.py
 ```
 
+批次召回完整流程（预留/确认/取消三类计划 → 召回与受影响孔清单 → 重复召回幂等/异因冲突/
+未知批次报错 → 新引用被拒且不冻结请求号 → 待处理预留不可确认但可取消 → 已确认结果原语义）：
+
+```bash
+bash examples/recall.sh
+python3 examples/recall_demo.py
+```
+
+最简调用：
+
+```bash
+# 召回（不可撤销）：原因相同返回原结果，原因不同 409，未知批次 404
+curl -sS -X POST http://localhost:8000/batches/S1/recall \
+  -H "Content-Type: application/json" \
+  -d '{"reason": "contamination found in QC run 42"}'
+
+# 随时取回召回记录与冻结的受影响计划/目标孔清单
+curl -sS http://localhost:8000/batches/S1/recall
+
+# 召回后新计划引用该批次 -> 409 batch_recalled（请求号不冻结）
+curl -sS -X POST http://localhost:8000/inventory/plans \
+  -H "Content-Type: application/json" -H "X-Request-ID: new-run" \
+  -d '{"batch_ids":["S1"], ...}'
+```
+
 示例（1000 浓度母液，移液器 500–1000nL、步进 100nL，目标 A1=400、A2=100）会生成
 两个中间液（如 400 与 100），并把较大的批量安排进较大的容器，所有转移均为 500–1000nL。
 
@@ -229,26 +309,26 @@ python3 examples/inventory_demo.py
 ```bash
 python3 tests/smoke.py
 python3 tests/api_smoke.py   # 需已安装 fastapi/pydantic/httpx
-python3 -m pytest tests/     # 完整测试（含库存模式与并发用例）
+python3 -m pytest tests/     # 完整测试（含库存模式、召回与并发用例）
 ```
 
 ## 6. 目录结构
 
 ```
 app/
-  main.py          FastAPI 路由与状态码（/plans、/batches、/inventory/plans、确认/取消）
+  main.py          FastAPI 路由与状态码（/plans、/batches、/inventory/plans、确认/取消、召回）
   models.py        Pydantic 请求/响应模型与浓度校验
-  planning.py      请求 -> 求解器映射、引用校验、幂等哈希、批次用量统计
-  db.py            asyncpg 连接池、建表、冻结/取回、批次登记、原子预留、确认/取消
+  planning.py      请求 -> 求解器映射、引用校验、幂等哈希、批次用量统计、批次->目标孔追踪
+  db.py            asyncpg 连接池、建表、冻结/取回、批次登记、原子预留、确认/取消、不可撤销召回
   solver/
     core.py        数据结构、移液器可行性、最小批量
     options.py     候选方案（直接/双源/新中间液/逐级稀释链）
     engine.py      回溯状态、批量与容器可行性
     solve.py       solve() 入口、计划组装、独立校验、无解诊断
 examples/          request.json、inventory.json、curl.sh、inventory.sh、
-                   call_api.py、inventory_demo.py
+                   call_api.py、inventory_demo.py、recall.sh、recall_demo.py
 tests/             smoke.py（求解器）、api_smoke.py（HTTP+幂等）、
-                   test_api.py、test_solver.py、test_inventory.py（库存/并发）
+                   test_api.py、test_solver.py、test_inventory.py（库存/并发/召回）
 Dockerfile, docker-compose.yml, requirements.txt
 ```
 
@@ -268,3 +348,27 @@ Dockerfile, docker-compose.yml, requirements.txt
    库存模式复用同一冻结机制（同号同体 `200` 原结果、同号异体 `409`）。
 6. **修复**：请求校验异常处理器现在对字段校验器抛出的 `ValueError`
    （如 `@` 前缀 ID）也能正确返回 `400`（此前会因错误对象无法 JSON 序列化而 500）。
+
+---
+
+## 8. 本轮变动（批次召回）
+
+1. **新增不可撤销召回**：`POST /batches/{id}/recall`（凭批次号 + 原因）与
+   `GET /batches/{id}/recall`；新增 `recalls` 表（启动时自动创建，含
+   `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` 兼容旧库），批次对象新增
+   `recalled` / `recall_reason` 字段。
+2. **受影响清单**：召回在同一事务内先以批次行 `FOR UPDATE` 锁定权威批次状态，
+   再快照受影响计划 —— 仅含**实际取用该批次**且预留为 `reserved`/`confirmed`
+   的计划（已取消不列），每条给出预留状态、实际转出体积与
+   **沿转移步骤穿过中间液追踪到的目标孔**（同计划同孔去重）。
+3. **召回后语义**：新计划引用召回批次一律 `409 batch_recalled` 且
+   **不冻结请求号、不占库存**；待处理预留**不可确认但仍可取消**；
+   已确认结果与召回前冻结请求的读取、重试、重复确认**保持原语义**。
+4. **并发裁决**：召回、计划创建、预留确认共用同一批次行锁（统一加锁顺序，无死锁），
+   按权威批次状态收敛：抢到锁先完成的预留/确认生效并被召回清单捕获，
+   其余被拒；召回生效后不可能再出现新预留或被确认的待处理预留。
+5. **幂等/冲突/报错**：同批次同原因重复召回返回原结果（`200 replayed:true`，
+   含召回当时冻结的清单），异原因 `409 recall_conflict`，未知批次 `404 unknown_batch`。
+6. **兼容性**：`/plans`、既有库存模式、`/health` 与建表启动方式行为不变；
+   新增示例 `examples/recall.sh`、`examples/recall_demo.py`；
+   召回与并发裁决用例加入 `tests/test_inventory.py`。

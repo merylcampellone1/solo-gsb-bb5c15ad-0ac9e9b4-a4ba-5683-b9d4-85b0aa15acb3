@@ -182,6 +182,24 @@ class InventoryPlanIn(BaseModel):
         return v
 
 
+class RecallIn(BaseModel):
+    """Irrevocable recall of a contaminated stock batch.
+
+    The batch id is carried in the URL path; the recall is identified by its
+    (batch, reason) pair: repeating the same reason replays the original
+    result, a different reason conflicts.
+    """
+    reason: str = Field(min_length=1, max_length=512)
+
+    @field_validator("reason")
+    @classmethod
+    def _reason(cls, v):
+        s = v.strip()
+        if not s:
+            raise ValueError("reason must not be empty")
+        return s
+
+
 # --------------------------------------------------------------------------- #
 # Response pieces
 # --------------------------------------------------------------------------- #

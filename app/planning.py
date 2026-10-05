@@ -72,6 +72,49 @@ def stock_usage_from_plan(plan: dict) -> dict:
     return usage
 
 
+def wells_for_batch_in_plan(plan: dict, batch_id: str) -> list[str]:
+    """Target wells traceable to ``batch_id`` through the plan's transfers.
+
+    The transfers may route stock via one or more intermediate containers,
+    so trace flow along the directed transfer graph: the batch node reaches a
+    well when some transfer chain connects them. The graph is a DAG (the
+    solver guarantees no cycles), so a fixed-point walk suffices. Each well is
+    reported once even if it is reached through several steps.
+    """
+    # node -> successor node set, flattened over individual pipette steps
+    successors: dict = {}
+    for t in plan["transfers"]:
+        s = _node_key(t["source"])
+        d = _node_key(t["destination"])
+        successors.setdefault(s, set()).add(d)
+
+    start = ("stock", batch_id, None)
+    seen: set = set()
+    stack = [start]
+    wells: set = set()
+    while stack:
+        node = stack.pop()
+        if node in seen:
+            continue
+        seen.add(node)
+        kind, ref, _container = node
+        if kind == "well":
+            wells.add(ref)
+        for nxt in successors.get(node, ()):  # target wells have no successors
+            stack.append(nxt)
+    return sorted(wells)
+
+
+def _node_key(label: dict) -> tuple:
+    """Identity key for a serialized node label.
+
+    ``{"kind": "intermediate", "id": "I1", "container": "tube-1"}`` and the
+    same intermediate labelled in another plan share kind+id; here each plan
+    is traced independently so container is carried along harmlessly.
+    """
+    return (label.get("kind"), label.get("id"), label.get("container"))
+
+
 def container_ids(req) -> list[str]:
     ids = []
     for i, c in enumerate(req.containers):
